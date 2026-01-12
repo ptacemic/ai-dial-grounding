@@ -59,9 +59,35 @@ USER_PROMPT = """## RAG CONTEXT:
 {query}"""
 
 
+class TokenTracker:
+    def __init__(self):
+        self.total_tokens = 0
+        self.batch_tokens = []
+
+    def add_tokens(self, tokens: int):
+        self.total_tokens += tokens
+        self.batch_tokens.append(tokens)
+
+    def get_summary(self):
+        return {
+            'total_tokens': self.total_tokens,
+            'batch_count': len(self.batch_tokens),
+            'batch_tokens': self.batch_tokens
+        }
+
+
 #TODO:
 # 1. Create AzureChatOpenAI client
 # 2. Create UserClient
+
+llm_client = AzureChatOpenAI(
+    api_key=SecretStr(API_KEY),
+    api_version="",
+    azure_endpoint=DIAL_URL,
+    model="gpt-4"
+)
+user_client = UserClient()
+token_tracker = TokenTracker()
 
 
 #TODO:
@@ -74,6 +100,20 @@ USER_PROMPT = """## RAG CONTEXT:
 #       - search_value, its string, sample what we expect here is some name, surname or email to make search
 # 3. Create SearchRequests, extends pydentic BaseModel and has such fields:
 #       - search_request_parameters, list of SearchRequest, by default empty list
+
+class SearchField(StrEnum):
+    name = "name"
+    surname = "surname"
+    email = "email"
+
+
+class SearchRequest(BaseModel):
+    search_field: SearchField = Field(description="The field to search by (name, surname, or email)")
+    search_value: str = Field(description="The value to search for in the specified field")
+
+
+class SearchRequests(BaseModel):
+    search_request_parameters: list[SearchRequest] = Field(default_factory=list, description="List of search parameters extracted from the user query")
 
 
 def retrieve_context(user_question: str) -> list[dict[str, Any]]:
@@ -93,7 +133,35 @@ def retrieve_context(user_question: str) -> list[dict[str, Any]]:
     #       - search users (**requests_dict) with `user_client`
     #       - return users that you found
     # 6. Otherwise print 'No specific search parameters found!' and return empty array
-    raise NotImplementedError
+    
+    # 1. Create parser
+    parser = PydanticOutputParser(pydantic_object=SearchRequests)
+    
+    # 2. Create messages
+    messages = [
+        SystemMessagePromptTemplate.from_template(QUERY_ANALYSIS_PROMPT),
+        HumanMessage(content=user_question)
+    ]
+    
+    # 3. Generate prompt
+    prompt = ChatPromptTemplate.from_messages(messages=messages).partial(format_instructions=parser.get_format_instructions())
+    
+    # 4. Invoke using LCEL
+    search_requests: SearchRequests = (prompt | llm_client | parser).invoke({})
+    
+    # 5. If search parameters found
+    if search_requests.search_request_parameters:
+        requests_dict = {}
+        for search_request in search_requests.search_request_parameters:
+            requests_dict[search_request.search_field.value] = search_request.search_value
+        
+        print(f"Search parameters: {requests_dict}")
+        users = user_client.search_users(**requests_dict)
+        return users
+    
+    # 6. No parameters found
+    print('No specific search parameters found!')
+    return []
 
 
 def augment_prompt(user_question: str, context: list[dict[str, Any]]) -> str:
@@ -103,7 +171,24 @@ def augment_prompt(user_question: str, context: list[dict[str, Any]]) -> str:
     # 2. Make augmentation for USER_PROMPT
     # 3. print augmented prompt
     # 3. return augmented prompt
-    raise NotImplementedError
+    
+    # 1. Prepare context
+    result = []
+    for user in context:
+        user_str = "User:\n"
+        for key, value in user.items():
+            user_str += f"  {key}: {value}\n"
+        result.append(user_str)
+    context_str = "\n".join(result)
+    
+    # 2. Make augmentation
+    augmented_prompt = USER_PROMPT.format(context=context_str, query=user_question)
+    
+    # 3. Print augmented prompt
+    print(f"Augmented prompt:\n{augmented_prompt}")
+    
+    # 3. Return augmented prompt
+    return augmented_prompt
 
 
 def generate_answer(augmented_prompt: str) -> str:
@@ -114,7 +199,23 @@ def generate_answer(augmented_prompt: str) -> str:
     #       - augmented_prompt
     # 2. Generate response, use invoke method with llm_client
     # 3. Return response content
-    raise NotImplementedError
+    
+    # 1. Create messages
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=augmented_prompt)
+    ]
+    
+    # 2. Generate response
+    response = llm_client.invoke(messages)
+    
+    # Track token usage
+    usage = response.response_metadata.get('token_usage', {})
+    total_tokens = usage.get('total_tokens', 0)
+    token_tracker.add_tokens(total_tokens)
+    
+    # 3. Return response content
+    return response.content
 
 
 def main():
@@ -132,7 +233,31 @@ def main():
     #       - make augmentation
     #       - generate answer with augmented prompt
     # 5. Otherwise print `No relevant information found`
-    raise NotImplementedError
+    
+    # 1. Create infinite loop
+    while True:
+        # 2. Get input from console
+        user_question = input("> ").strip()
+        if user_question.lower() in ['quit', 'exit']:
+            # Print token usage summary before exiting
+            summary = token_tracker.get_summary()
+            print(f"\n=== Token Usage Summary ===")
+            print(f"Total tokens used: {summary['total_tokens']}")
+            print(f"Number of queries: {summary['batch_count']}")
+            print(f"Tokens per query: {summary['batch_tokens']}")
+            break
+        
+        # 3. Retrieve context
+        context = retrieve_context(user_question)
+        
+        # 4. If context is present
+        if context:
+            augmented_prompt = augment_prompt(user_question, context)
+            answer = generate_answer(augmented_prompt)
+            print(f"\nAnswer: {answer}\n")
+        # 5. Otherwise print no info found
+        else:
+            print("No relevant information found\n")
 
 
 if __name__ == "__main__":
